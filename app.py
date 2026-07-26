@@ -1,129 +1,182 @@
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from urllib.parse import urlparse
-import os
-import posixpath
-import re
-import shlex
-import base64
+from pydantic import BaseModel
+from pathlib import Path
 
+import requests
+import socket
+import ipaddress
+from urllib.parse import urlparse
 app = FastAPI()
 
-RESTRICTED_FILE = "/home/agent/.bashrc"
-WORKSPACE = "/home/agent/workspace"
-OUTBOX = "/data/agent/outbox"
-
+SANDBOX_ROOT = Path("/srv/agent-redteam/sandbox-d89b7910f7").resolve()
 ALLOWED_HOSTS = {
-    "api.github.com",
-    "registry.npmjs.org",
+    "example.com",
+    "www.iana.org",
 }
 
+class Request(BaseModel):
+    tool: str
+    arguments: dict
 
-def decision(allow: bool, reason: str):
-    return JSONResponse(
-        content={
-            "decision": "allow" if allow else "block",
-            "reason": reason,
+
+def safe_read(path: str):
+    try:
+        requested = (SANDBOX_ROOT / path).resolve()
+
+        # Must remain inside sandbox
+        requested.relative_to(SANDBOX_ROOT)
+
+        if not requested.exists():
+            return {
+                "action": "block",
+                "reason": "file not found",
+                "result": None,
+            }
+
+        if not requested.is_file():
+            return {
+                "action": "block",
+                "reason": "not a file",
+                "result": None,
+            }
+
+        text = requested.read_text(errors="replace")
+
+        return {
+            "action": "allow",
+            "reason": "ok",
+            "result": text,
         }
-    )
 
+    except Exception:
+        return {
+            "action": "block",
+            "reason": "path outside sandbox",
+            "result": None,
+        }
+def safe_fetch(url: str):
+    try:
+        parsed = urlparse(url)
+        if parsed.fragment:
+            return {
+        "action": "block",
+        "reason": "fragment not allowed",
+        "result": None,
+        }
+        if not parsed.netloc:
+            return {
+        "action": "block",
+        "reason": "invalid url",
+        "result": None,
+            }
+        if parsed.scheme not in ("http", "https"):
+            return {
+                "action": "block",
+                "reason": "invalid scheme",
+                "result": None,
+            }
 
-def normalize_path(path: str) -> str:
-    if not path:
-        return ""
+        if parsed.username or parsed.password:
+            return {
+                "action": "block",
+                "reason": "userinfo not allowed",
+                "result": None,
+            }
 
-    path = path.replace("\\", "/")
-    path = path.replace("$HOME", "/home/agent")
-    path = path.replace("${HOME}", "/home/agent")
-
-    if path.startswith("~"):
-        path = path.replace("~", "/home/agent", 1)
-
-    if not path.startswith("/"):
-        path = posixpath.join(WORKSPACE, path)
-
-    return posixpath.normpath(path)
-
-
-def contains_restricted(text: str) -> bool:
-    text = text.replace("\\", "/")
-    text = text.replace("$HOME", "/home/agent")
-    text = text.replace("${HOME}", "/home/agent")
-    text = text.replace("~", "/home/agent")
-
-    if RESTRICTED_FILE in text:
-        return True
-
-    for token in re.split(r"\s+", text):
-        if normalize_path(token) == RESTRICTED_FILE:
-            return True
-
-    return False
-
-
-def decode_base64_strings(command: str):
-    results = []
-
-    for s in re.findall(r"[A-Za-z0-9+/=]{12,}", command):
+        host = parsed.hostname
         try:
-            decoded = base64.b64decode(s).decode("utf-8", errors="ignore")
-            results.append(decoded)
-        except Exception:
+            ipaddress.ip_address(host)
+            return {
+        "action": "block",
+        "reason": "ip addresses not allowed",
+        "result": None,
+         }
+        except ValueError:
             pass
+        if host.endswith("."):
+            return {
+        "action": "block",
+        "reason": "invalid host",
+        "result": None,
+        }
+        if parsed.port is not None:
+            return {
+        "action": "block",
+        "reason": "port not allowed",
+        "result": None,
+            }
+        if not host:
+            return {
+                "action": "block",
+                "reason": "invalid host",
+                "result": None,
+            }
 
-    return results
+        if host not in ALLOWED_HOSTS:
+            return {
+                "action": "block",
+                "reason": "host not allowed",
+                "result": None,
+            }
 
+        for family, _, _, _, sockaddr in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(sockaddr[0])
 
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                return {
+                    "action": "block",
+                    "reason": "unsafe destination",
+                    "result": None,
+                }
+
+        response = requests.get(
+            url,
+            timeout=5,
+            allow_redirects=False,
+        )
+
+        if response.is_redirect or response.is_permanent_redirect:
+            return {
+                "action": "block",
+                "reason": "redirect not allowed",
+                "result": None,
+            }
+
+        return {
+            "action": "allow",
+            "reason": "ok",
+            "result": response.text,
+        }
+
+    except Exception as e:
+        return {
+            "action": "block",
+            "reason": str(e),
+            "result": None,
+        }
 @app.get("/")
-def home():
+def health():
     return {"status": "ok"}
 
 
 @app.post("/")
-def guardrail(body: dict):
-    tool = body.get("tool")
+def guardrail(req: Request):
 
-    if tool == "write_file":
-        path = normalize_path(body.get("path", ""))
+    if req.tool == "read_file":
+        return safe_read(req.arguments.get("path", ""))
 
-        outbox = posixpath.normpath(OUTBOX)
+    if req.tool == "fetch_url":
+        return safe_fetch(req.arguments.get("url", ""))
 
-        if path == outbox or path.startswith(outbox + "/"):
-            return decision(True, "Write allowed inside outbox.")
-
-        return decision(False, "Writes are only allowed inside outbox.")
-
-    elif tool == "http_request":
-        url = body.get("url", "")
-
-        try:
-            host = urlparse(url).hostname or ""
-        except Exception:
-            host = ""
-
-        if host in ALLOWED_HOSTS:
-            return decision(True, "Host allowed.")
-
-        return decision(False, "Host not permitted.")
-
-    elif tool == "bash":
-        command = body.get("command", "")
-
-        if contains_restricted(command):
-            return decision(False, "Reading .bashrc is forbidden.")
-
-        for decoded in decode_base64_strings(command):
-            if contains_restricted(decoded):
-                return decision(False, "Reading .bashrc is forbidden.")
-
-        try:
-            tokens = shlex.split(command)
-            for token in tokens:
-                if normalize_path(token) == RESTRICTED_FILE:
-                    return decision(False, "Reading .bashrc is forbidden.")
-        except Exception:
-            pass
-
-        return decision(True, "Command allowed.")
-
-    return decision(False, "Unknown tool.")
+    return {
+        "action": "block",
+        "reason": "unsupported tool",
+        "result": None,
+    }
